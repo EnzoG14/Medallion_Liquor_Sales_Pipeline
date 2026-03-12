@@ -8,22 +8,23 @@ El objetivo principal es procesar un volumen masivo de registros transaccionales
 
 ## 🛠️ Stack Tecnológico
 * **Procesamiento Distribuido:** Apache Spark (PySpark)
-* **Almacenamiento y Formato:** Delta Lake
+* **Almacenamiento y Formato:** Delta Lake, Parquet
 * **Plataforma:** Databricks / Unity Catalog
 * **Lenguajes:** Python, Databricks SQL
 
 ## 🏗️ Arquitectura de Datos (Medallion Architecture)
 El pipeline de datos sigue estrictamente la Arquitectura Medallion para garantizar la calidad, auditabilidad y rendimiento de los datos desde su estado crudo hasta el modelo analítico final.
 
-### 🥉 Capa Bronze (Raw Data)
-* **Ingesta:** Lectura de múltiples archivos CSV crudos (`AAAA_MM_iowa_sales.csv`).
-* **Protección contra "Column Shift":** Implementación de lecturas permisivas con manejo avanzado de comillas y saltos de línea (`multiLine=true`).
-* **Detección de Corrupción:** Reglas programáticas en PySpark usando `try_cast` para identificar filas con tipos de datos inválidos o columnas desplazadas sin interrumpir el pipeline.
+### 🥉 Capa Bronze (Raw Data - As-Is)
+* **Ingesta Dinámica de Parquet:** Lectura de múltiples archivos `.parquet` históricos. 
+* **Manejo de Inconsistencias de Tipos (Type Mismatch):** Implementación de lectura aislada de archivos y casteo temporal de todas las columnas a `String` en memoria para evitar fallos por discrepancias de tipos de datos entre archivos de diferentes años (ej. `DOUBLE` vs `STRING`).
+* **Unión Tolerante a Fallos:** Uso de `unionByName` con `allowMissingColumns=True` para unificar dinámicamente esquemas mutables antes de persistir en Delta Lake.
 
-### 🥈 Capa Silver (Cleansed & Conformed Data)
-* **Estandarización:** Limpieza de strings (mayúsculas, trim), parseo robusto de fechas mixtas (`COALESCE` para formatos `MM/dd/yyyy` y `yyyy-MM-dd`), y transformación de strings financieros (ej. `$4,30` -> `4.30`).
-* **Cuarentena y Deduplicación:** Filtrado de registros corruptos (aislados en cuarentena) y eliminación de transacciones duplicadas por llave primaria (`invoice_line_no`).
-* **Integridad Referencial:** Manejo estratégico de valores nulos (Null Handling). Asignación del valor `-1` (Unknown Member) a atributos faltantes (ej. `county_number`) para evitar la pérdida de métricas financieras vitales durante los cruces (JOINs).
+### 🥈 Capa Silver (Cleansed, Conformed & Incremental)
+* **Auditoría y Cuarentena (DLQ):** Implementación del patrón *Dead Letter Queue*. Las reglas programáticas en PySpark auditan los datos crudos mediante `try_cast`. Los registros corruptos o incompletos se rutean automáticamente a una tabla de auditoría (`sales_quarantine`) sin detener el pipeline.
+* **Carga Incremental (Upsert):** Uso de la API `DeltaTable` para ejecutar operaciones `MERGE` eficientes, actualizando facturas existentes o insertando nuevas sin reprocesar toda la historia.
+* **Estandarización y Tipado:** Limpieza de strings financieros (símbolos de moneda, separadores de miles), parseo robusto de fechas mixtas (`COALESCE`) y asignación definitiva de tipos de datos.
+* **Integridad Referencial:** Asignación del valor `-1` (Unknown Member) a atributos descriptivos faltantes para evitar la pérdida de métricas financieras vitales durante los cruces dimensionales.
 
 ### 🥇 Capa Gold (Dimensional Modeling - Star Schema)
 El modelo final está diseñado mediante un **Esquema Estrella (Star Schema)** optimizado para consultas analíticas de alto rendimiento.
@@ -35,17 +36,17 @@ El modelo final está diseñado mediante un **Esquema Estrella (Star Schema)** o
 * `Dim_Date`: Dimensión de tiempo generada dinámicamente.
 * `Dim_Product`: Dimensión de productos y categorías (SCD Tipo 1).
 * `Dim_Vendor`: Dimensión de proveedores (SCD Tipo 1).
-* **`Dim_Store` (SCD Tipo 2):** Implementación de Slowly Changing Dimension Type 2 para mantener la fidelidad histórica de los cambios geográficos (mudanzas, cierres o cambios de condado) de las tiendas utilizando `valid_from`, `valid_to` e `is_current`.
+* **`Dim_Store` (SCD Tipo 2):** Implementación de Slowly Changing Dimension Tipo 2 mediante `UNION ALL` y `MERGE` para mantener la fidelidad histórica de los cambios geográficos (mudanzas, cierres) de las tiendas utilizando `valid_from`, `valid_to` e `is_current`.
 
 ## 🧠 Desafíos Técnicos Resueltos
-1. **Manejo Dinámico de Esquemas:** Implementación de configuraciones programáticas en Python (mediante diccionarios e iteradores) para la inicialización parametrizada, escalable y eficiente de catálogos y esquemas.
-2. **Formateo de Datos Internacionales:** Resolución de conflictos entre separadores de miles y decimales europeos/americanos directamente en la lectura de PySpark.
-3. **Carga Histórica SCD2:** Diseño de un `MERGE` de dos fases (Update + Insert mediante `UNION ALL`) en Delta Lake para historizar dimensiones sin duplicar ventas en la tabla de hechos.
+1. **Manejo Dinámico de Esquemas:** Resolución de conflictos críticos de tipos de datos en archivos Parquet de origen incierto, aislando lecturas y unificando metadatos programáticamente en Python.
+2. **Implementación de Cuarentena (DLQ):** Diseño de un enrutamiento de datos bidireccional en la capa Silver para aislar registros anómalos, garantizando un 100% de éxito en la ingesta Bronze y facilitando la auditoría de calidad de datos.
+3. **Cargas Incrementales y SCD2:** Transición de cargas *Full Refresh* a patrones `MERGE` (Upsert) tanto para la tabla de hechos en Silver como para el versionado histórico complejo de dimensiones en Gold, optimizando los costos de cómputo.
 
 ## 🚀 Estructura del Repositorio
 * `00_Setup.ipynb`: Inicialización de la infraestructura en Unity Catalog y generación de la Dimensión de Tiempo.
-* `01_Loading_Bronze.ipynb`: Ingesta segura de archivos crudos y auditoría de calidad de datos.
-* `02_Loading_Silver.ipynb`: Estandarización, parseo de tipos de datos y manejo de nulos (Unknown Members).
+* `01_Loading_Bronze.ipynb`: Ingesta cruda y manejo de Schema Drift en archivos Parquet.
+* `02_Loading_Silver.ipynb`: Auditoría de calidad, patrón DLQ, estandarización y Upsert incremental.
 * `03_Loading_Dimensions.ipynb`: Carga y actualización de dimensiones utilizando SCD Tipo 1 y Tipo 2.
 * `04_Loading_Fact.ipynb`: Cruce eficiente con llaves subrogadas y carga de la tabla de hechos.
 * `05_Consultas.ipynb`: Script SQL con las consultas de valor de negocio (YoY Growth, Market Share, Price Elasticity).
